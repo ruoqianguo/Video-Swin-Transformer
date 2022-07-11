@@ -184,7 +184,7 @@ class BaseRecognizer(nn.Module, metaclass=ABCMeta):
             return cls_score
 
         batch_size = cls_score.shape[0]
-        cls_score = cls_score.view(batch_size // num_segs, num_segs, -1)
+        cls_score = cls_score.view(-1, num_segs, cls_score.shape[-1])
 
         if average_clips == 'prob':
             cls_score = F.softmax(cls_score, dim=2).mean(dim=1)

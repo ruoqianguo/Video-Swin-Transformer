@@ -35,7 +35,7 @@ class Mlp(nn.Module):
         return x
 
 
-def window_partition(x, window_size):
+def window_partition(x, window_size, D, H, W, C):
     """
     Args:
         x: (B, D, H, W, C)
@@ -44,13 +44,12 @@ def window_partition(x, window_size):
     Returns:
         windows: (B*num_windows, window_size*window_size, C)
     """
-    B, D, H, W, C = x.shape
-    x = x.view(B, D // window_size[0], window_size[0], H // window_size[1], window_size[1], W // window_size[2], window_size[2], C)
+    x = x.view(-1, D // window_size[0], window_size[0], H // window_size[1], window_size[1], W // window_size[2], window_size[2], C)
     windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, reduce(mul, window_size), C)
     return windows
 
 
-def window_reverse(windows, window_size, B, D, H, W):
+def window_reverse(windows, window_size, D, H, W, C):
     """
     Args:
         windows: (B*num_windows, window_size, window_size, C)
@@ -61,8 +60,8 @@ def window_reverse(windows, window_size, B, D, H, W):
     Returns:
         x: (B, D, H, W, C)
     """
-    x = windows.view(B, D // window_size[0], H // window_size[1], W // window_size[2], window_size[0], window_size[1], window_size[2], -1)
-    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, D, H, W, -1)
+    x = windows.view(-1, D // window_size[0], H // window_size[1], W // window_size[2], window_size[0], window_size[1], window_size[2], C)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(-1, D, H, W, C)
     return x
 
 
@@ -142,7 +141,7 @@ class WindowAttention3D(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, N, N) or None
         """
         B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # B_, nH, N, C
 
         q = q * self.scale
@@ -155,7 +154,7 @@ class WindowAttention3D(nn.Module):
 
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
@@ -187,11 +186,12 @@ class SwinTransformerBlock3D(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self, dim, num_heads, window_size=(2,7,7), shift_size=(0,0,0),
+    def __init__(self, dim, input_resolution, num_heads, window_size=(2,7,7), shift_size=(0,0,0),
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_checkpoint=False):
         super().__init__()
         self.dim = dim
+        self.input_resolution = input_resolution
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
@@ -212,58 +212,58 @@ class SwinTransformerBlock3D(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward_part1(self, x, mask_matrix):
-        B, D, H, W, C = x.shape
-        window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
+        D, H, W = self.input_resolution
+        window_size, shift_size = get_window_size((D,H,W), self.window_size, self.shift_size)
+        attn_mask = compute_mask(D, H, W, window_size, shift_size)
+        self.register_buffer("attn_mask", attn_mask)
 
+    def forward_part1(self, x, B, D, H, W, C):
+        window_size, shift_size = get_window_size((D,H,W), self.window_size, self.shift_size)
         x = self.norm1(x)
-        # pad feature maps to multiples of window size
-        pad_l = pad_t = pad_d0 = 0
-        pad_d1 = (window_size[0] - D % window_size[0]) % window_size[0]
-        pad_b = (window_size[1] - H % window_size[1]) % window_size[1]
-        pad_r = (window_size[2] - W % window_size[2]) % window_size[2]
-        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b, pad_d0, pad_d1))
-        _, Dp, Hp, Wp, _ = x.shape
+        x = x.view(B, D, H, W, C)
         # cyclic shift
         if any(i > 0 for i in shift_size):
             shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3))
-            attn_mask = mask_matrix
+            attn_mask = self.attn_mask
         else:
             shifted_x = x
             attn_mask = None
         # partition windows
-        x_windows = window_partition(shifted_x, window_size)  # B*nW, Wd*Wh*Ww, C
+        x_windows = window_partition(shifted_x, window_size, D, H, W, C)  # B*nW, Wd*Wh*Ww, C
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=attn_mask)  # B*nW, Wd*Wh*Ww, C
         # merge windows
         attn_windows = attn_windows.view(-1, *(window_size+(C,)))
-        shifted_x = window_reverse(attn_windows, window_size, B, Dp, Hp, Wp)  # B D' H' W' C
+        shifted_x = window_reverse(attn_windows, window_size, D, H, W, C)  # B D' H' W' C
         # reverse cyclic shift
         if any(i > 0 for i in shift_size):
             x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
         else:
             x = shifted_x
 
-        if pad_d1 >0 or pad_r > 0 or pad_b > 0:
-            x = x[:, :D, :H, :W, :].contiguous()
+        x = x.view(B, D * H * W, C)
         return x
 
     def forward_part2(self, x):
         return self.drop_path(self.mlp(self.norm2(x)))
 
-    def forward(self, x, mask_matrix):
+    def forward(self, x):
         """ Forward function.
 
         Args:
-            x: Input feature, tensor size (B, D, H, W, C).
+            x: Input feature, tensor size (B, D*H*W, C).
             mask_matrix: Attention mask for cyclic shift.
         """
+        D, H, W = self.input_resolution
+        B, L, C = x.shape
 
         shortcut = x
         if self.use_checkpoint:
-            x = checkpoint.checkpoint(self.forward_part1, x, mask_matrix)
+            # B, D, H, W, C = x.shape
+            x = checkpoint.checkpoint(self.forward_part1, x, B, D, H, W, C)
         else:
-            x = self.forward_part1(x, mask_matrix)
+            # B, D, H, W, C = x.shape
+            x = self.forward_part1(x, B, D, H, W, C)
         x = shortcut + self.drop_path(x)
 
         if self.use_checkpoint:
@@ -281,30 +281,53 @@ class PatchMerging(nn.Module):
         dim (int): Number of input channels.
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
-    def __init__(self, dim, norm_layer=nn.LayerNorm):
+    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
         super().__init__()
+        self.input_resolution = input_resolution
         self.dim = dim
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
+        # """ Forward function.
+
+        # Args:
+        #     x: Input feature, tensor size (B, D, H, W, C).
+        # """
+        # B, D, H, W, C = x.shape
+
+        # # padding
+        # pad_input = (H % 2 == 1) or (W % 2 == 1)
+        # if pad_input:
+        #     x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+
+        # x0 = x[:, :, 0::2, 0::2, :]  # B D H/2 W/2 C
+        # x1 = x[:, :, 1::2, 0::2, :]  # B D H/2 W/2 C
+        # x2 = x[:, :, 0::2, 1::2, :]  # B D H/2 W/2 C
+        # x3 = x[:, :, 1::2, 1::2, :]  # B D H/2 W/2 C
+        # x = torch.cat([x0, x1, x2, x3], -1)  # B D H/2 W/2 4*C
+
+        # x = self.norm(x)
+        # x = self.reduction(x)
+
+        # return x
+
         """ Forward function.
 
         Args:
-            x: Input feature, tensor size (B, D, H, W, C).
+            x: Input feature, tensor size (B, D*H*W, C).
         """
-        B, D, H, W, C = x.shape
+        D, H, W = self.input_resolution
+        B, L, C = x.shape
 
-        # padding
-        pad_input = (H % 2 == 1) or (W % 2 == 1)
-        if pad_input:
-            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+        x = x.view(B, D, H, W, C)
 
         x0 = x[:, :, 0::2, 0::2, :]  # B D H/2 W/2 C
         x1 = x[:, :, 1::2, 0::2, :]  # B D H/2 W/2 C
         x2 = x[:, :, 0::2, 1::2, :]  # B D H/2 W/2 C
         x3 = x[:, :, 1::2, 1::2, :]  # B D H/2 W/2 C
         x = torch.cat([x0, x1, x2, x3], -1)  # B D H/2 W/2 4*C
+        x = x.view(B, -1, x.shape[-1])  # B D*H/2*W/2 4*C
 
         x = self.norm(x)
         x = self.reduction(x)
@@ -314,15 +337,15 @@ class PatchMerging(nn.Module):
 
 # cache each stage results
 @lru_cache()
-def compute_mask(D, H, W, window_size, shift_size, device):
-    img_mask = torch.zeros((1, D, H, W, 1), device=device)  # 1 Dp Hp Wp 1
+def compute_mask(D, H, W, window_size, shift_size):
+    img_mask = torch.zeros((1, D, H, W, 1))  # 1 Dp Hp Wp 1
     cnt = 0
     for d in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0],None):
         for h in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1],None):
             for w in slice(-window_size[2]), slice(-window_size[2], -shift_size[2]), slice(-shift_size[2],None):
                 img_mask[:, d, h, w, :] = cnt
                 cnt += 1
-    mask_windows = window_partition(img_mask, window_size)  # nW, ws[0]*ws[1]*ws[2], 1
+    mask_windows = window_partition(img_mask, window_size, D, H, W, 1)  # nW, ws[0]*ws[1]*ws[2], 1
     mask_windows = mask_windows.squeeze(-1)  # nW, ws[0]*ws[1]*ws[2]
     attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
     attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
@@ -349,6 +372,7 @@ class BasicLayer(nn.Module):
 
     def __init__(self,
                  dim,
+                 input_resolution,
                  depth,
                  num_heads,
                  window_size=(1,7,7),
@@ -365,12 +389,14 @@ class BasicLayer(nn.Module):
         self.window_size = window_size
         self.shift_size = tuple(i // 2 for i in window_size)
         self.depth = depth
+        self.input_resolution = input_resolution
         self.use_checkpoint = use_checkpoint
 
         # build blocks
         self.blocks = nn.ModuleList([
             SwinTransformerBlock3D(
                 dim=dim,
+                input_resolution=input_resolution,
                 num_heads=num_heads,
                 window_size=window_size,
                 shift_size=(0,0,0) if (i % 2 == 0) else self.shift_size,
@@ -387,29 +413,44 @@ class BasicLayer(nn.Module):
         
         self.downsample = downsample
         if self.downsample is not None:
-            self.downsample = downsample(dim=dim, norm_layer=norm_layer)
+            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
 
     def forward(self, x):
+        # """ Forward function.
+
+        # Args:
+        #     x: Input feature, tensor size (B, C, D, H, W).
+        # """
+        # # calculate attention mask for SW-MSA
+        # B, C, D, H, W = x.shape
+        # window_size, shift_size = get_window_size((D,H,W), self.window_size, self.shift_size)
+        # x = rearrange(x, 'b c d h w -> b d h w c')
+        # Dp = int(np.ceil(D / window_size[0])) * window_size[0]
+        # Hp = int(np.ceil(H / window_size[1])) * window_size[1]
+        # Wp = int(np.ceil(W / window_size[2])) * window_size[2]
+        # attn_mask = compute_mask(Dp, Hp, Wp, window_size, shift_size, x.device)
+        # for blk in self.blocks:
+        #     x = blk(x, attn_mask)
+        # x = x.view(B, D, H, W, -1)
+
+        # if self.downsample is not None:
+        #     x = self.downsample(x)
+        # x = rearrange(x, 'b d h w c -> b c d h w')
+        # return x
+
         """ Forward function.
 
         Args:
-            x: Input feature, tensor size (B, C, D, H, W).
+            x: Input feature, tensor size (B, D*H*W, C).
         """
-        # calculate attention mask for SW-MSA
-        B, C, D, H, W = x.shape
-        window_size, shift_size = get_window_size((D,H,W), self.window_size, self.shift_size)
-        x = rearrange(x, 'b c d h w -> b d h w c')
-        Dp = int(np.ceil(D / window_size[0])) * window_size[0]
-        Hp = int(np.ceil(H / window_size[1])) * window_size[1]
-        Wp = int(np.ceil(W / window_size[2])) * window_size[2]
-        attn_mask = compute_mask(Dp, Hp, Wp, window_size, shift_size, x.device)
+        D, H, W = self.input_resolution
+        B, L, C = x.shape
+
         for blk in self.blocks:
-            x = blk(x, attn_mask)
-        x = x.view(B, D, H, W, -1)
+            x = blk(x)
 
         if self.downsample is not None:
             x = self.downsample(x)
-        x = rearrange(x, 'b d h w c -> b c d h w')
         return x
 
 
@@ -422,8 +463,11 @@ class PatchEmbed3D(nn.Module):
         embed_dim (int): Number of linear projection output channels. Default: 96.
         norm_layer (nn.Module, optional): Normalization layer. Default: None
     """
-    def __init__(self, patch_size=(2,4,4), in_chans=3, embed_dim=96, norm_layer=None):
+    def __init__(self, video_size=(16, 224, 224), patch_size=(2,4,4), in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
+        self.video_size = video_size
+        self.patches_resolution = [video_size[0] // patch_size[0], video_size[1] // patch_size[1], video_size[2] // patch_size[2]]
+        self.num_patches = self.patches_resolution[0] * self.patches_resolution[1] * self.patches_resolution[2]
         self.patch_size = patch_size
 
         self.in_chans = in_chans
@@ -439,19 +483,20 @@ class PatchEmbed3D(nn.Module):
         """Forward function."""
         # padding
         _, _, D, H, W = x.size()
-        if W % self.patch_size[2] != 0:
-            x = F.pad(x, (0, self.patch_size[2] - W % self.patch_size[2]))
-        if H % self.patch_size[1] != 0:
-            x = F.pad(x, (0, 0, 0, self.patch_size[1] - H % self.patch_size[1]))
-        if D % self.patch_size[0] != 0:
-            x = F.pad(x, (0, 0, 0, 0, 0, self.patch_size[0] - D % self.patch_size[0]))
+        # if W % self.patch_size[2] != 0:
+        #     x = F.pad(x, (0, self.patch_size[2] - W % self.patch_size[2]))
+        # if H % self.patch_size[1] != 0:
+        #     x = F.pad(x, (0, 0, 0, self.patch_size[1] - H % self.patch_size[1]))
+        # if D % self.patch_size[0] != 0:
+        #     x = F.pad(x, (0, 0, 0, 0, 0, self.patch_size[0] - D % self.patch_size[0]))
 
         x = self.proj(x)  # B C D Wh Ww
+        x = x.flatten(2).transpose(1, 2) # B D*Wh*Ww C
         if self.norm is not None:
-            D, Wh, Ww = x.size(2), x.size(3), x.size(4)
-            x = x.flatten(2).transpose(1, 2)
+            # D, Wh, Ww = x.size(2), x.size(3), x.size(4)
+            # x = x.flatten(2).transpose(1, 2)
             x = self.norm(x)
-            x = x.transpose(1, 2).view(-1, self.embed_dim, D, Wh, Ww)
+            # x = x.transpose(1, 2).view(-1, self.embed_dim, D, Wh, Ww)
 
         return x
 
@@ -483,6 +528,7 @@ class SwinTransformer3D(nn.Module):
     def __init__(self,
                  pretrained=None,
                  pretrained2d=True,
+                 video_size=(16, 224, 224),
                  patch_size=(4,4,4),
                  in_chans=3,
                  embed_dim=96,
@@ -512,8 +558,10 @@ class SwinTransformer3D(nn.Module):
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed3D(
+            video_size=video_size,
             patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None)
+        self.patches_resolution = self.patch_embed.patches_resolution
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 
@@ -525,6 +573,9 @@ class SwinTransformer3D(nn.Module):
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
                 dim=int(embed_dim * 2**i_layer),
+                input_resolution=(self.patches_resolution[0], # keep resolution 
+                                                 self.patches_resolution[1] // (2 ** i_layer),
+                                                 self.patches_resolution[2] // (2 ** i_layer)),
                 depth=depths[i_layer],
                 num_heads=num_heads[i_layer],
                 window_size=window_size,
@@ -656,9 +707,12 @@ class SwinTransformer3D(nn.Module):
         for layer in self.layers:
             x = layer(x.contiguous())
 
-        x = rearrange(x, 'n c d h w -> n d h w c')
+        # x = rearrange(x, 'n c d h w -> n d h w c')
+        D, H, W = self.patches_resolution[0], self.patches_resolution[1] // 2**(self.num_layers - 1), self.patches_resolution[2] // 2**(self.num_layers - 1)
         x = self.norm(x)
-        x = rearrange(x, 'n d h w c -> n c d h w')
+        x = x.transpose(1, 2) # B C L
+        x = x.view(x.size(0), x.size(1), D, H, W)
+        # x = rearrange(x, 'n d h w c -> n c d h w')
 
         return x
 
